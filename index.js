@@ -6,6 +6,7 @@ import session from 'express-session';
 import passport from "passport";
 import { Strategy } from "passport-local";
 import env from 'dotenv';
+import GoogleStrategy from 'passport-google-oauth2';
 
 const app = express();
 const port = 3000;
@@ -20,15 +21,18 @@ app.use(session({
     maxAge: 1000 * 60 *60 * 24
   }
 }));
+app.use(bodyParser.urlencoded({ extended: true }));
+app.use(express.static("public"));
+
 app.use(passport.initialize());
 app.use(passport.session());
 
 const db = new pg.Client({
-  user: 'postgres',
-  password: '1234',
-  host: 'localhost',
-  database: 'Secrets',
-  port: 5432
+  user: process.env.PG_USER,
+  password: process.env.PG_PASSWORD,
+  host: process.env.PG_HOST,
+  database: process.env.PG_DATABASE,
+  port: process.env.PG_PORT
 })
 db.connect((err) => {
   if(err){
@@ -37,9 +41,6 @@ db.connect((err) => {
     console.log('Connection Successfully')
   }
 })
-
-app.use(bodyParser.urlencoded({ extended: true }));
-app.use(express.static("public"));
 
 app.get("/", (req, res) => {
   res.render("home.ejs");
@@ -53,13 +54,72 @@ app.get("/register", (req, res) => {
   res.render("register.ejs");
 });
 
-app.get('/secrets', (req, res) => {
+app.get('/logout', (req, res) => {
+  req.logout(function (err){
+    if(err){
+      return next(err);
+    }
+    res.redirect("/")
+  })
+})
+
+app.get('/secrets', async (req, res) => {
+  try {
+    const result = req.user;
+    if(req.isAuthenticated()){
+      const userSecret = (await db.query(
+        'SELECT secret FROM users WHERE email = $1', [result.email])).rows[0]
+        console.log(userSecret)
+      res.render("secrets.ejs", {secret: userSecret.secret})
+
+    }else{
+      throw new Error("User is not authenticated!");
+    }
+  } catch (error) {
+    res.redirect('/')
+  }
+  
+})
+app.get('/submit', (req, res) => {
   if(req.isAuthenticated()){
-    res.render("secrets.ejs")
+    res.render("submit.ejs")
   }else{
     res.redirect('/')
   }
 })
+
+app.get('/auth/google', passport.authenticate("google", {
+  scope: ["profile", "email"]
+}))
+
+app.get('/auth/google/secrets', passport.authenticate("google", {
+  successRedirect: "/secrets",
+  failureRedirect: "/login"
+}));
+
+app.post('/submit', async (req, res) => {
+  const input = req.body.secret;
+  try {
+    if(input){
+      const result = await db.query(
+        "UPDATE users SET secret = ($1) WHERE email = ($2) RETURNING *", 
+        [input, req.user.email]);
+
+      res.redirect('/secrets');
+    }else{
+     throw new Error("Preencha o campo de segredo!");
+    }
+  } catch (error) {
+    console.log(error)
+    res.redirect('/secrets')
+  }
+})
+
+app.post("/login", passport.authenticate("local", {
+  successRedirect: "/secrets",
+  failureRedirect: "/login"
+  })
+);
 
 app.post("/register", async (req, res) => {
   const email = req.body.username
@@ -93,13 +153,7 @@ app.post("/register", async (req, res) => {
   }
 });
 
-app.post("/login", passport.authenticate("local", {
-  successRedirect: "/secrets",
-  failureRedirect: "/login"
-  })
-);
-
-passport.use(
+passport.use("local",
   new Strategy(async function verify(username, password, cb) {
   try {
     const result = await db.query('SELECT * FROM users WHERE email = $1', 
@@ -126,6 +180,26 @@ passport.use(
     return cb(error)
   }
 }));
+
+passport.use("google", new GoogleStrategy({
+    clientID: process.env.GOOGLE_CLIENT_ID,
+    clientSecret: process.env.GOOGLE_CLIENT_SECRET,
+    callbackURL: "http://localhost:3000/auth/google/secrets",
+    userProfileURL: "https://www.googleapis.com/oauth2/v3/userinfo"
+  }, async (accessToken, refreshToken, profile, cb) => {
+    try {
+      const result = await db.query("SELECT * FROM users WHERE email = $1", [profile.email]);
+      if(result.rows.length === 0){
+        const newUser = await db.query("INSERT INTO users (email, password) VALUES ($1, $2)", [profile.email, "GOOGLE"])
+        cb(null, newUser.rows[0]);
+      }else{
+        cb(null, result.rows[0]);
+      }
+    } catch (error) {
+      cb(error)
+    }
+  }
+))
 
 passport.serializeUser((user, cb) => {
   cb(null, user);
